@@ -449,8 +449,8 @@ def create_parser():
         metavar="N",
         help=(
             "Cap on new tokens per generate() for --hunyuan-transformers. "
-            "If omitted, uses the full remaining model context (max positions minus prompt). "
-            "There is no unlimited mode: the model and VRAM still impose a hard ceiling."
+            "If omitted, uses min(remaining context, 32768) per call so one batch does "
+            "not run for hours; set a higher value if you need longer single completions."
         ),
     )
     service_group = parser.add_argument_group(

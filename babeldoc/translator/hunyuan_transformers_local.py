@@ -26,6 +26,11 @@ from babeldoc.utils.atomic_integer import AtomicInteger
 
 logger = logging.getLogger(__name__)
 
+# When --hunyuan-max-new-tokens is omitted, cap each generate() separately. Using the
+# entire remaining context (e.g. 100k+ new tokens) in one forward pass can run for
+# hours and look "stuck"; long documents still use many sequential generates.
+_DEFAULT_PER_CALL_NEW_TOKEN_CEILING = 32768
+
 
 def _chat_template_to_input_ids(tokenized, torch_module):
     """``apply_chat_template(..., return_tensors='pt')`` may return a Tensor or BatchEncoding."""
@@ -125,7 +130,7 @@ class HunyuanTransformersTranslator(BaseTranslator):
             room = 1
         if self._max_new_tokens_cap is not None:
             return min(self._max_new_tokens_cap, room)
-        return room
+        return min(room, _DEFAULT_PER_CALL_NEW_TOKEN_CEILING)
 
     def _generate_text(self, user_text: str) -> str:
         messages = [{"role": "user", "content": user_text}]
