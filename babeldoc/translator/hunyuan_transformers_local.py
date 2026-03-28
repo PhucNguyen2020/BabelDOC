@@ -54,6 +54,7 @@ class HunyuanTransformersTranslator(BaseTranslator):
         ignore_cache: bool = False,
         device_map: str | dict | None = "auto",
         torch_dtype: str | None = None,
+        max_new_tokens: int | None = None,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
         try:
@@ -87,13 +88,41 @@ class HunyuanTransformersTranslator(BaseTranslator):
             **load_kw,
         )
         self._model.eval()
+        # None = use all remaining positions in the model context per call (minus prompt).
+        # A positive int caps generation (still clipped to context room to avoid HF errors).
+        self._max_new_tokens_cap = max_new_tokens
         self._generate_lock = threading.Lock()
         self.token_count = AtomicInteger()
         self.prompt_token_count = AtomicInteger()
         self.completion_token_count = AtomicInteger()
         self.cache_hit_prompt_token_count = AtomicInteger()
 
-    def _generate_text(self, user_text: str) -> str:
+    def _effective_context_length(self) -> int:
+        """Upper bound on total sequence length (prompt + new tokens) for this model."""
+        m = self._model.config
+        ctx = getattr(m, "max_position_embeddings", None)
+        if not isinstance(ctx, int) or ctx <= 0:
+            ctx = getattr(m, "n_positions", None)
+        if not isinstance(ctx, int) or ctx <= 0:
+            ctx = 32768
+        tok_ml = getattr(self._tokenizer, "model_max_length", None)
+        # Tokenizers often use a huge sentinel; only treat as a real cap when reasonable.
+        if isinstance(tok_ml, int) and 0 < tok_ml <= 1_000_000:
+            ctx = min(ctx, tok_ml)
+        return ctx
+
+    def _max_new_tokens_for(self, input_len: int) -> int:
+        """Budget for generate(); cannot exceed model context minus prompt."""
+        ctx = self._effective_context_length()
+        reserve = 64
+        room = ctx - input_len - reserve
+        if room < 1:
+            room = 1
+        if self._max_new_tokens_cap is not None:
+            return min(self._max_new_tokens_cap, room)
+        return room
+
+    def _generate_text(self, user_text: str, *, request_json_mode: bool = False) -> str:
         messages = [{"role": "user", "content": user_text}]
         tokenized = self._tokenizer.apply_chat_template(
             messages,
@@ -104,18 +133,30 @@ class HunyuanTransformersTranslator(BaseTranslator):
         device = next(self._model.parameters()).device
         input_ids = _chat_template_to_input_ids(tokenized, self._torch).to(device)
         input_len = int(input_ids.shape[-1])
+        budget = self._max_new_tokens_for(input_len)
+
+        # Batch paragraph translation and term extraction ask for strict JSON; sampling
+        # causes truncated or malformed JSON (length mismatch / parse errors). Greedy
+        # decoding and a larger budget reduce those failures.
+        if request_json_mode:
+            gen_kw = {
+                "max_new_tokens": budget,
+                "do_sample": False,
+                "repetition_penalty": 1.05,
+            }
+        else:
+            gen_kw = {
+                "max_new_tokens": budget,
+                "do_sample": True,
+                "temperature": 0.7,
+                "top_p": 0.6,
+                "top_k": 20,
+                "repetition_penalty": 1.05,
+            }
 
         with self._generate_lock:
             with self._torch.inference_mode():
-                outputs = self._model.generate(
-                    input_ids,
-                    max_new_tokens=2048,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.6,
-                    top_k=20,
-                    repetition_penalty=1.05,
-                )
+                outputs = self._model.generate(input_ids, **gen_kw)
 
         generated_ids = outputs[0][input_len:]
         self.prompt_token_count.inc(input_len)
@@ -132,4 +173,7 @@ class HunyuanTransformersTranslator(BaseTranslator):
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         if text is None:
             return None
-        return self._generate_text(text)
+        request_json = bool(
+            rate_limit_params and rate_limit_params.get("request_json_mode")
+        )
+        return self._generate_text(text, request_json_mode=request_json)

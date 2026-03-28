@@ -442,6 +442,17 @@ def create_parser():
         default=None,
         help="Optional torch dtype for weights, e.g. bfloat16 (default: model default).",
     )
+    translation_group.add_argument(
+        "--hunyuan-max-new-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Cap on new tokens per generate() for --hunyuan-transformers. "
+            "If omitted, uses the full remaining model context (max positions minus prompt). "
+            "There is no unlimited mode: the model and VRAM still impose a hard ceiling."
+        ),
+    )
     service_group = parser.add_argument_group(
         "Translation - OpenAI Options",
         description="OpenAI specific options",
@@ -618,6 +629,7 @@ async def main():
             ignore_cache=args.ignore_cache,
             device_map=args.hunyuan_device_map,
             torch_dtype=args.hunyuan_torch_dtype,
+            max_new_tokens=args.hunyuan_max_new_tokens,
         )
         term_extraction_translator = translator
     elif args.openai:
