@@ -78,6 +78,11 @@ class HunyuanTransformersTranslator(BaseTranslator):
             model_name_or_path,
         )
         self._tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        # Avoid generate() stopping immediately on some checkpoints when pad is unset.
+        if getattr(self._tokenizer, "pad_token_id", None) is None and getattr(
+            self._tokenizer, "eos_token_id", None
+        ) is not None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
         load_kw: dict = {"device_map": device_map}
         if torch_dtype:
             td = getattr(torch, torch_dtype, None)
@@ -122,7 +127,7 @@ class HunyuanTransformersTranslator(BaseTranslator):
             return min(self._max_new_tokens_cap, room)
         return room
 
-    def _generate_text(self, user_text: str, *, request_json_mode: bool = False) -> str:
+    def _generate_text(self, user_text: str) -> str:
         messages = [{"role": "user", "content": user_text}]
         tokenized = self._tokenizer.apply_chat_template(
             messages,
@@ -135,24 +140,24 @@ class HunyuanTransformersTranslator(BaseTranslator):
         input_len = int(input_ids.shape[-1])
         budget = self._max_new_tokens_for(input_len)
 
-        # Batch paragraph translation and term extraction ask for strict JSON; sampling
-        # causes truncated or malformed JSON (length mismatch / parse errors). Greedy
-        # decoding and a larger budget reduce those failures.
-        if request_json_mode:
-            gen_kw = {
-                "max_new_tokens": budget,
-                "do_sample": False,
-                "repetition_penalty": 1.05,
-            }
-        else:
-            gen_kw = {
-                "max_new_tokens": budget,
-                "do_sample": True,
-                "temperature": 0.7,
-                "top_p": 0.6,
-                "top_k": 20,
-                "repetition_penalty": 1.05,
-            }
+        # Official HY-MT inference params (Tencent README): temperature / top_p / top_k /
+        # repetition_penalty. Use them for both plain translation and JSON batch prompts.
+        # Greedy decoding often yields immediate EOS or tiny outputs on long structured
+        # prompts; sampling matches upstream docs and reduces "Output: 9 token" failures.
+        pad_id = getattr(self._tokenizer, "pad_token_id", None)
+        eos_id = getattr(self._tokenizer, "eos_token_id", None)
+        gen_kw = {
+            "max_new_tokens": budget,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.6,
+            "top_k": 20,
+            "repetition_penalty": 1.05,
+        }
+        if pad_id is not None:
+            gen_kw["pad_token_id"] = pad_id
+        if eos_id is not None:
+            gen_kw["eos_token_id"] = eos_id
 
         with self._generate_lock:
             with self._torch.inference_mode():
@@ -173,7 +178,4 @@ class HunyuanTransformersTranslator(BaseTranslator):
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         if text is None:
             return None
-        request_json = bool(
-            rate_limit_params and rate_limit_params.get("request_json_mode")
-        )
-        return self._generate_text(text, request_json_mode=request_json)
+        return self._generate_text(text)
