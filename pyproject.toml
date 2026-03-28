@@ -52,12 +52,17 @@ dependencies = [
     "scipy>=1.15.3",
     "uharfbuzz>=0.50.2",
     "scikit-learn>=1.7.1",
+    "python-dotenv>=1.2.2",
 ]
 
 [project.optional-dependencies]
 directml = ["onnxruntime-directml>=1.16.1"]
 cuda = ["onnxruntime-gpu>=1.16.1"]
 memray = ["memray>=1.17.1"]
+hunyuan-transformers = [
+    "transformers>=4.56.0",
+    "accelerate>=0.34.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/funstory-ai/BabelDOC"

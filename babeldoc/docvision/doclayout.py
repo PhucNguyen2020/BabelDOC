@@ -98,6 +98,12 @@ class OnnxModel(DocLayoutModel):
     @staticmethod
     def from_pretrained():
         pth = get_doclayout_onnx_model_path()
+        if not pth:
+            raise RuntimeError(
+                "DocLayout ONNX model is unavailable (download may have failed). "
+                "Use a working network, run `babeldoc --warmup` while online, or "
+                "`babeldoc --restore-offline-assets` with a package from an online machine."
+            )
         return OnnxModel(pth)
 
     @property

@@ -29,6 +29,16 @@ from tenacity import wait_exponential
 
 logger = logging.getLogger(__name__)
 
+# Warmup used to open one connection per cmap/font and overwhelm raw.githubusercontent.com
+# (503 Backend.max_conn). Cap concurrency and pool size; allow slow links to finish.
+_ASSET_DOWNLOAD_CONCURRENCY = 8
+_ASSET_HTTP_TIMEOUT = httpx.Timeout(120.0, connect=60.0)
+_ASSET_HTTP_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=16)
+
+
+def create_asset_async_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=_ASSET_HTTP_TIMEOUT, limits=_ASSET_HTTP_LIMITS)
+
 
 _FASTEST_FONT_UPSTREAM_LOCK = asyncio.Lock()
 _FASTEST_FONT_UPSTREAM: str | None = None
@@ -45,13 +55,19 @@ class ResultContainer:
 
 def run_in_another_thread(coro):
     result_container = ResultContainer()
+    thread_error: list[BaseException] = []
 
     def _wrapper():
-        result_container.set_result(asyncio.run(coro))
+        try:
+            result_container.set_result(asyncio.run(coro))
+        except BaseException as e:
+            thread_error.append(e)
 
     thread = threading.Thread(target=_wrapper)
     thread.start()
     thread.join()
+    if thread_error:
+        raise thread_error[0]
     return result_container.result
 
 
@@ -106,7 +122,7 @@ async def download_file(
     sha3_256: str = None,
 ):
     if client is None:
-        async with httpx.AsyncClient() as client:
+        async with create_asset_async_client() as client:
             response = await client.get(url, follow_redirects=True)
     else:
         response = await client.get(url, follow_redirects=True)
@@ -136,7 +152,7 @@ async def get_font_metadata(
         exit(1)
 
     if client is None:
-        async with httpx.AsyncClient() as client:
+        async with create_asset_async_client() as client:
             response = await client.get(
                 FONT_METADATA_URL[upstream], follow_redirects=True
             )
@@ -327,7 +343,9 @@ def get_font_and_metadata(font_file_name: str):
 
 
 async def get_cmap_file_path_async(
-    name: str, client: httpx.AsyncClient | None = None
+    name: str,
+    client: httpx.AsyncClient | None = None,
+    fastest_upstream: str | None = None,
 ) -> Path:
     """Get cached cmap file path, downloading it if necessary."""
     if name.endswith(".json"):
@@ -345,7 +363,7 @@ async def get_cmap_file_path_async(
         return cache_file_path
 
     logger.info(f"CMap {cache_file_path} not found or corrupted, downloading...")
-    await download_cmap_file_async(file_name, client)
+    await download_cmap_file_async(file_name, client, fastest_upstream)
     if not verify_file(cache_file_path, meta["sha3_256"]):
         logger.critical(f"Failed to verify downloaded cmap file: {cache_file_path}")
         exit(1)
@@ -353,17 +371,20 @@ async def get_cmap_file_path_async(
 
 
 async def download_cmap_file_async(
-    file_name: str, client: httpx.AsyncClient | None = None
+    file_name: str,
+    client: httpx.AsyncClient | None = None,
+    fastest_upstream: str | None = None,
 ) -> Path:
     """Download a single cmap file to cache directory."""
     if file_name not in CMAP_METADATA:
         logger.critical(f"CMap {file_name} not found in CMAP_METADATA")
         exit(1)
 
-    fastest_upstream, _ = await get_fastest_upstream_for_font(client)
     if fastest_upstream is None:
-        logger.critical("Failed to get fastest upstream for cmap")
-        exit(1)
+        fastest_upstream, _ = await get_fastest_upstream_for_font(client)
+        if fastest_upstream is None:
+            logger.critical("Failed to get fastest upstream for cmap")
+            exit(1)
 
     if fastest_upstream not in CMAP_URL_BY_UPSTREAM:
         logger.critical(f"Invalid fastest upstream for cmap: {fastest_upstream}")
@@ -414,12 +435,16 @@ async def download_all_fonts_async(client: httpx.AsyncClient | None = None):
         exit(1)
     logger.info(f"Downloading fonts from {fastest_upstream}")
 
-    font_tasks = [
-        asyncio.create_task(
-            get_font_and_metadata_async(
+    sem = asyncio.Semaphore(_ASSET_DOWNLOAD_CONCURRENCY)
+
+    async def _download_one_font(font_file_name: str):
+        async with sem:
+            return await get_font_and_metadata_async(
                 font_file_name, client, fastest_upstream, font_metadata
             )
-        )
+
+    font_tasks = [
+        asyncio.create_task(_download_one_font(font_file_name))
         for font_file_name in EMBEDDING_FONT_METADATA
     ]
     await asyncio.gather(*font_tasks)
@@ -443,8 +468,16 @@ async def download_all_cmaps_async(client: httpx.AsyncClient | None = None):
         exit(1)
     logger.info(f"Downloading cmaps from {fastest_upstream}")
 
+    sem = asyncio.Semaphore(_ASSET_DOWNLOAD_CONCURRENCY)
+
+    async def _download_one_cmap(cmap_file_name: str):
+        async with sem:
+            return await get_cmap_file_path_async(
+                cmap_file_name, client, fastest_upstream
+            )
+
     cmap_tasks = [
-        asyncio.create_task(get_cmap_file_path_async(cmap_file_name, client))
+        asyncio.create_task(_download_one_cmap(cmap_file_name))
         for cmap_file_name in CMAP_METADATA
     ]
     await asyncio.gather(*cmap_tasks)
@@ -455,7 +488,7 @@ async def async_warmup():
     from tiktoken import encoding_for_model
 
     _ = encoding_for_model("gpt-4o")
-    async with httpx.AsyncClient() as client:
+    async with create_asset_async_client() as client:
         onnx_task = asyncio.create_task(get_doclayout_onnx_model_path_async(client))
         onnx_task2 = asyncio.create_task(
             get_table_detection_rapidocr_model_path_async(client)

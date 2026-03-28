@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import multiprocessing as mp
+import os
 import queue
 import random
 import sys
@@ -9,6 +10,8 @@ from typing import Any
 
 import configargparse
 import tqdm
+from dotenv import find_dotenv
+from dotenv import load_dotenv
 from rich.progress import BarColumn
 from rich.progress import MofNCompleteColumn
 from rich.progress import Progress
@@ -22,6 +25,7 @@ from babeldoc.const import enable_process_pool
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from babeldoc.glossary import Glossary
+from babeldoc.translator.hunyuan_mt import HunyuanMTTranslator
 from babeldoc.translator.translator import OpenAITranslator
 from babeldoc.translator.translator import set_translate_rate_limiter
 
@@ -385,11 +389,58 @@ def create_parser():
         help="Skip formula offset calculation (default: False)",
     )
     # service option argument group
-    service_group = translation_group.add_mutually_exclusive_group()
-    service_group.add_argument(
+    translator_backend = translation_group.add_mutually_exclusive_group()
+    translator_backend.add_argument(
         "--openai",
         action="store_true",
-        help="Use OpenAI translator.",
+        help="Use OpenAI-compatible translator (OpenAI, proxies, local Ollama /v1, etc.).",
+    )
+    translation_group.add_argument(
+        "--ollama-cloud",
+        action="store_true",
+        help=(
+            "Point the OpenAI-compatible client at Ollama Cloud (https://ollama.com/v1). "
+            "Implies --openai; use with --openai-api-key or OLLAMA_API_KEY."
+        ),
+    )
+    translation_group.add_argument(
+        "--hunyuan-mt",
+        action="store_true",
+        help=(
+            "Use Tencent Hunyuan HY-MT prompts and sampling with an OpenAI-compatible "
+            "HTTP server (e.g. vLLM/SGLang serving HF HY-MT weights). Implies --openai; "
+            "defaults: base URL http://127.0.0.1:8000/v1 or HY_MT_OPENAI_BASE_URL. "
+            "Model: HY_MT_MODEL or 'hunyuan'; key: HY_MT_API_KEY or 'dummy'. "
+            "For local transformers without HTTP, use --hunyuan-transformers."
+        ),
+    )
+    translation_group.add_argument(
+        "--hunyuan-transformers",
+        action="store_true",
+        help=(
+            "Run Tencent HY-MT in-process with Hugging Face transformers (official "
+            "apply_chat_template + generate). Requires: pip install "
+            "'babeldoc[hunyuan-transformers]' and PyTorch. Mutually exclusive with "
+            "--openai, --ollama-cloud, and --hunyuan-mt."
+        ),
+    )
+    translation_group.add_argument(
+        "--hunyuan-model-path",
+        default=None,
+        help=(
+            "HF model id or local directory for --hunyuan-transformers. "
+            "If unset: HY_MT_TRANSFORMERS_MODEL, else tencent/HY-MT1.5-1.8B."
+        ),
+    )
+    translation_group.add_argument(
+        "--hunyuan-device-map",
+        default="auto",
+        help="device_map passed to AutoModelForCausalLM.from_pretrained (default: auto).",
+    )
+    translation_group.add_argument(
+        "--hunyuan-torch-dtype",
+        default=None,
+        help="Optional torch dtype for weights, e.g. bfloat16 (default: model default).",
     )
     service_group = parser.add_argument_group(
         "Translation - OpenAI Options",
@@ -397,8 +448,11 @@ def create_parser():
     )
     service_group.add_argument(
         "--openai-model",
-        default="gpt-4o-mini",
-        help="The OpenAI model to use for translation.",
+        default=None,
+        help=(
+            "The OpenAI model to use for translation. "
+            "If unset: OPENAI_MODEL, then OLLAMA_MODEL env, else gpt-4o-mini."
+        ),
     )
     service_group.add_argument(
         "--openai-base-url",
@@ -459,6 +513,7 @@ def create_parser():
 
 
 async def main():
+    load_dotenv(find_dotenv(usecwd=True))
     parser = create_parser()
     args: Any = parser.parse_args()
 
@@ -484,23 +539,93 @@ async def main():
         logger.info("Warmup completed, exiting...")
         return
 
+    if args.ollama_cloud and args.hunyuan_mt:
+        parser.error("不能同时使用 --ollama-cloud 与 --hunyuan-mt")
+
+    if args.hunyuan_transformers and (
+        args.openai or args.ollama_cloud or args.hunyuan_mt
+    ):
+        parser.error(
+            "不能将 --hunyuan-transformers 与 --openai、--ollama-cloud 或 --hunyuan-mt 同时使用"
+        )
+
+    if args.ollama_cloud:
+        args.openai = True
+        if not args.openai_base_url:
+            args.openai_base_url = "https://ollama.com/v1"
+
+    if args.hunyuan_mt:
+        args.openai = True
+        if not args.openai_base_url:
+            args.openai_base_url = os.environ.get(
+                "HY_MT_OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"
+            )
+
     # 验证翻译服务选择
-    if not args.openai:
-        parser.error("必须选择一个翻译服务：--openai")
+    if not (args.openai or args.hunyuan_transformers):
+        parser.error(
+            "必须选择一个翻译服务：--openai、--ollama-cloud、--hunyuan-mt 或 "
+            "--hunyuan-transformers"
+        )
+
+    if args.openai and not args.openai_api_key:
+        args.openai_api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get(
+            "OLLAMA_API_KEY"
+        )
+    if args.openai and not args.openai_api_key and args.hunyuan_mt:
+        args.openai_api_key = os.environ.get("HY_MT_API_KEY", "dummy")
+
+    if args.openai and not args.openai_model:
+        if args.hunyuan_mt:
+            args.openai_model = (
+                os.environ.get("HY_MT_MODEL")
+                or os.environ.get("OPENAI_MODEL")
+                or os.environ.get("OLLAMA_MODEL")
+                or "hunyuan"
+            )
+        else:
+            args.openai_model = (
+                os.environ.get("OPENAI_MODEL")
+                or os.environ.get("OLLAMA_MODEL")
+                or "gpt-4o-mini"
+            )
+
+    if args.hunyuan_transformers and not args.hunyuan_model_path:
+        args.hunyuan_model_path = os.environ.get(
+            "HY_MT_TRANSFORMERS_MODEL", "tencent/HY-MT1.5-1.8B"
+        )
 
     # 验证 OpenAI 参数
     if args.openai and not args.openai_api_key:
-        parser.error("使用 OpenAI 服务时必须提供 API key")
+        parser.error(
+            "使用翻译服务时必须提供 API key（--openai-api-key，或在 .env / 环境中设置 "
+            "OPENAI_API_KEY 或 OLLAMA_API_KEY）"
+        )
 
     if args.enable_process_pool:
         enable_process_pool()
 
     # 实例化翻译器
-    if args.openai:
+    if args.hunyuan_transformers:
+        from babeldoc.translator.hunyuan_transformers_local import (
+            HunyuanTransformersTranslator,
+        )
+
+        translator = HunyuanTransformersTranslator(
+            lang_in=args.lang_in,
+            lang_out=args.lang_out,
+            model_name_or_path=args.hunyuan_model_path,
+            ignore_cache=args.ignore_cache,
+            device_map=args.hunyuan_device_map,
+            torch_dtype=args.hunyuan_torch_dtype,
+        )
+        term_extraction_translator = translator
+    elif args.openai:
+        _translator_cls = HunyuanMTTranslator if args.hunyuan_mt else OpenAITranslator
         translator_kwargs: dict[str, Any] = {}
         if args.openai_reasoning is not None:
             translator_kwargs["reasoning"] = args.openai_reasoning
-        translator = OpenAITranslator(
+        translator = _translator_cls(
             lang_in=args.lang_in,
             lang_out=args.lang_out,
             model=args.openai_model,
@@ -523,7 +648,7 @@ async def main():
                 term_translator_kwargs["reasoning"] = (
                     args.openai_term_extraction_reasoning
                 )
-            term_extraction_translator = OpenAITranslator(
+            term_extraction_translator = _translator_cls(
                 lang_in=args.lang_in,
                 lang_out=args.lang_out,
                 model=args.openai_term_extraction_model or args.openai_model,
